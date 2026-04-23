@@ -1,0 +1,27 @@
+{
+  "model_name_or_path": "meta-llama/Llama-3.1-8B-Instruct",
+  "train_file": "data/final/train.jsonl",
+  "valid_file": "data/final/valid.jsonl",
+  "output_dir": "outputs/checkpoints",
+  "epochs": 3,
+  "batch_size": 2,
+  "lr": 0.0002,
+  "max_length": 1024,
+  "grad_accum": 8,
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+  "use_4bit": false,
+  "device_map": "auto",
+  "logging_steps": 20,
+  "save_total_limit": 2,
+  "target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+  ]
+}

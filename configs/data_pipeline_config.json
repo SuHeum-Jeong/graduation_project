@@ -1,0 +1,20 @@
+{
+  "seed": 42,
+  "train_ratio": 0.7,
+  "valid_ratio": 0.15,
+  "test_ratio": 0.15,
+  "prefix_step": 5,
+  "version": "v1",
+  "stratify_by_label": true,
+  "paths": {
+    "raw_normal_dir": "data/raw/normal",
+    "raw_abnormal_dir": "data/raw/abnormal",
+    "augmented_abnormal_dir": "data/augmented/abnormal",
+    "labeled_normal_dir": "data/labeled/normal",
+    "labeled_abnormal_dir": "data/labeled/abnormal",
+    "samples_conversation_dir": "data/samples/conversation",
+    "samples_prefix_dir": "data/samples/prefix",
+    "final_dir": "data/final",
+    "splits_dir": "data/splits"
+  }
+}

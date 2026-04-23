@@ -1,0 +1,32 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv*/
+.conda*/
+env/
+venv/
+
+# Local data and generated artifacts
+data/
+outputs/
+checkpoints/
+models/
+runs/
+wandb/
+
+# Model and dataset binaries
+*.bin
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.parquet
+*.pkl
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local Codex/session metadata
+.codex

@@ -1,0 +1,13 @@
+{
+  "model_name_or_path": "meta-llama/Llama-3.1-8B-Instruct",
+  "adapter_path": "outputs/checkpoints/adapter-final",
+  "dataset_path": "data/final/test.jsonl",
+  "output_dir": "outputs/finetuned_eval",
+  "max_samples": null,
+  "max_new_tokens": 8,
+  "temperature": 0.0,
+  "do_sample": false,
+  "torch_dtype": "bfloat16",
+  "device_map": "auto",
+  "batch_size": 2
+}

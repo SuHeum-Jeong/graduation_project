@@ -17,6 +17,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.common import calc_binary_metrics, get_row_label, make_prompt
 
 
+VALID_LABELS = {"0", "1"}
+CANDIDATE_LABELS = ["0", "1"]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -213,23 +217,11 @@ def score_candidate_labels(
     return scores_by_row
 
 
-def main() -> None:
-    args = parse_args()
-    config = load_json(args.config)
-    dataset_path = Path(config["dataset_path"])
-    output_dir = Path(config["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-    predictions_path = output_dir / "predictions.jsonl"
-
-    dataset = load_jsonl(dataset_path)
-    max_samples = config.get("max_samples")
-    if isinstance(max_samples, int):
-        dataset = dataset[:max_samples]
-
+def load_model_and_tokenizer(config: dict[str, Any]) -> tuple[Any, Any, Any]:
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise SystemExit(
             "transformers/torch/peft가 설치되어 있지 않습니다. "
@@ -251,45 +243,140 @@ def main() -> None:
     adapter_path = config.get("adapter_path")
     if adapter_path:
         model = PeftModel.from_pretrained(model, adapter_path)
+
     model.eval()
     model_input_device = next(model.parameters()).device
+    return model, tokenizer, model_input_device
 
-    resume_enabled = bool(config.get("resume", True))
-    flush_every_rows = max(1, int(config.get("flush_every_rows", 10)))
-    progress_every_rows = max(1, int(config.get("progress_every_rows", 100)))
 
-    y_true: list[str] = []
-    y_pred: list[str] = []
+def restore_previous_run(
+    predictions_path: Path,
+    resume_enabled: bool,
+) -> tuple[list[dict[str, Any]], set[str], list[str], list[str]]:
+    # Resume 모드에서는 기존 predictions.jsonl을 재사용해 중복 추론을 피한다.
     prediction_rows: list[dict[str, Any]] = []
     processed_sample_ids: set[str] = set()
-    rows_since_flush = 0
+    y_true: list[str] = []
+    y_pred: list[str] = []
 
-    if resume_enabled and predictions_path.exists():
-        prediction_rows = load_jsonl(predictions_path)
-        for row in prediction_rows:
-            sample_id = row.get("sample_id")
-            if sample_id is not None:
-                processed_sample_ids.add(str(sample_id))
-            gold = row.get("gold")
-            prediction = row.get("prediction")
-            if gold in {"0", "1"} and prediction in {"0", "1"}:
-                y_true.append(gold)
-                y_pred.append(prediction)
+    if not (resume_enabled and predictions_path.exists()):
+        return prediction_rows, processed_sample_ids, y_true, y_pred
+
+    prediction_rows = load_jsonl(predictions_path)
+    for row in prediction_rows:
+        sample_id = row.get("sample_id")
+        if sample_id is not None:
+            processed_sample_ids.add(str(sample_id))
+        gold = row.get("gold")
+        prediction = row.get("prediction")
+        if gold in VALID_LABELS and prediction in VALID_LABELS:
+            y_true.append(gold)
+            y_pred.append(prediction)
+    return prediction_rows, processed_sample_ids, y_true, y_pred
+
+
+def compute_next_progress_report(
+    processed_count_before_run: int,
+    progress_every_rows: int,
+    total_rows: int,
+) -> int:
+    if processed_count_before_run >= total_rows:
+        return total_rows
+    return ((processed_count_before_run // progress_every_rows) + 1) * progress_every_rows
+
+
+def build_prediction_row(
+    row: dict[str, Any],
+    score_map: dict[str, float],
+    prompt_text: str,
+    was_truncated: bool,
+) -> dict[str, Any]:
+    gold = get_row_label(row)
+    prediction = max(CANDIDATE_LABELS, key=lambda label: score_map.get(label, float("-inf")))
+    return {
+        "sample_id": row["sample_id"],
+        "sample_type": row["sample_type"],
+        "parent_conversation_id": row.get("parent_conversation_id"),
+        "gold": gold or None,
+        "prediction": prediction,
+        "raw_prediction_text": prediction,
+        "label_scores": score_map,
+        "prompt_truncated": was_truncated,
+        "prompt_char_length": len(prompt_text),
+        "correct": prediction == gold if gold in VALID_LABELS else None,
+    }
+
+
+def maybe_record_metric_labels(
+    prediction_row: dict[str, Any],
+    y_true: list[str],
+    y_pred: list[str],
+) -> None:
+    gold = prediction_row["gold"]
+    prediction = prediction_row["prediction"]
+    if gold in VALID_LABELS and prediction in VALID_LABELS:
+        y_true.append(gold)
+        y_pred.append(prediction)
+
+
+def maybe_print_progress(
+    processed_total: int,
+    next_progress_report: int,
+    progress_every_rows: int,
+    total_rows: int,
+    started_at: float,
+    processed_count_before_run: int,
+) -> int:
+    if processed_total < next_progress_report:
+        return next_progress_report
+
+    # 현재 실행(run)에서 처리한 속도를 기준으로 단순 ETA를 계산한다.
+    elapsed_seconds = time.time() - started_at
+    processed_in_run = max(1, processed_total - processed_count_before_run)
+    rows_left = max(0, total_rows - processed_total)
+    eta_seconds = int((elapsed_seconds / processed_in_run) * rows_left)
+    print(
+        f"[PROGRESS] {processed_total}/{total_rows} "
+        f"(elapsed={int(elapsed_seconds)}s, eta~{eta_seconds}s)"
+    )
+    return next_progress_report + progress_every_rows
+
+
+def flush_predictions_file(predictions_file: Any) -> None:
+    # 중단 시에도 결과 유실을 줄이기 위해 flush + fsync를 함께 수행한다.
+    predictions_file.flush()
+    os.fsync(predictions_file.fileno())
+
+
+def run_evaluation(
+    *,
+    dataset: list[dict[str, Any]],
+    model: Any,
+    tokenizer: Any,
+    model_input_device: Any,
+    predictions_path: Path,
+    resume_enabled: bool,
+    flush_every_rows: int,
+    progress_every_rows: int,
+    batch_size: int,
+    max_length: int,
+    max_prompt_tokens: int,
+) -> tuple[list[dict[str, Any]], list[str], list[str], int, int]:
+    prediction_rows, processed_sample_ids, y_true, y_pred = restore_previous_run(
+        predictions_path=predictions_path,
+        resume_enabled=resume_enabled,
+    )
 
     predictions_file_mode = "a" if resume_enabled and predictions_path.exists() else "w"
     processed_count_before_run = len(processed_sample_ids)
     total_rows = len(dataset)
     started_at = time.time()
-    next_progress_report = (
-        ((processed_count_before_run // progress_every_rows) + 1) * progress_every_rows
-        if processed_count_before_run < total_rows
-        else total_rows
+    next_progress_report = compute_next_progress_report(
+        processed_count_before_run=processed_count_before_run,
+        progress_every_rows=progress_every_rows,
+        total_rows=total_rows,
     )
-    batch_size = max(1, int(config.get("batch_size", 1)))
-    candidate_labels = ["0", "1"]
-    max_length = resolve_effective_max_length(tokenizer, config)
-    label_token_reserve = max(8, int(config.get("label_token_reserve", 16)))
-    max_prompt_tokens = max(1, max_length - label_token_reserve)
+    rows_since_flush = 0
 
     with predictions_path.open(predictions_file_mode, encoding="utf-8") as predictions_file:
         for start_idx in range(0, len(dataset), batch_size):
@@ -302,6 +389,7 @@ def main() -> None:
             if not batch_rows:
                 continue
 
+            # 1) 프롬프트 생성 -> 2) 길이 제한 맞춤 -> 3) 라벨 점수 산출
             raw_prompt_texts = [
                 build_chat_prompt(
                     tokenizer,
@@ -318,56 +406,95 @@ def main() -> None:
                 model=model,
                 tokenizer=tokenizer,
                 prompt_texts=prompt_texts,
-                candidate_labels=candidate_labels,
+                candidate_labels=CANDIDATE_LABELS,
                 model_input_device=model_input_device,
                 max_length=max_length,
             )
+
             for row, score_map, (_, was_truncated), prompt_text in zip(
                 batch_rows,
                 label_scores,
                 trimmed_prompt_pairs,
                 prompt_texts,
             ):
-                gold = get_row_label(row)
-                prediction = max(candidate_labels, key=lambda label: score_map.get(label, float("-inf")))
-                if gold in {"0", "1"}:
-                    y_true.append(gold)
-                    y_pred.append(prediction)
-                prediction_row = {
-                    "sample_id": row["sample_id"],
-                    "sample_type": row["sample_type"],
-                    "parent_conversation_id": row.get("parent_conversation_id"),
-                    "gold": gold or None,
-                    "prediction": prediction,
-                    "raw_prediction_text": prediction,
-                    "label_scores": score_map,
-                    "prompt_truncated": was_truncated,
-                    "prompt_char_length": len(prompt_text),
-                    "correct": prediction == gold if gold in {"0", "1"} else None,
-                }
+                # 샘플 단위 결과를 즉시 기록해 재개(resume) 시 그대로 이어받는다.
+                prediction_row = build_prediction_row(
+                    row=row,
+                    score_map=score_map,
+                    prompt_text=prompt_text,
+                    was_truncated=was_truncated,
+                )
+                maybe_record_metric_labels(prediction_row, y_true, y_pred)
                 prediction_rows.append(prediction_row)
                 processed_sample_ids.add(str(row.get("sample_id")))
+
                 predictions_file.write(json.dumps(prediction_row, ensure_ascii=False) + "\n")
+
                 processed_total = len(processed_sample_ids)
-                if processed_total >= next_progress_report:
-                    elapsed_seconds = time.time() - started_at
-                    processed_in_run = max(1, processed_total - processed_count_before_run)
-                    rows_left = max(0, total_rows - processed_total)
-                    eta_seconds = int((elapsed_seconds / processed_in_run) * rows_left)
-                    print(
-                        f"[PROGRESS] {processed_total}/{total_rows} "
-                        f"(elapsed={int(elapsed_seconds)}s, eta~{eta_seconds}s)"
-                    )
-                    next_progress_report += progress_every_rows
+                next_progress_report = maybe_print_progress(
+                    processed_total=processed_total,
+                    next_progress_report=next_progress_report,
+                    progress_every_rows=progress_every_rows,
+                    total_rows=total_rows,
+                    started_at=started_at,
+                    processed_count_before_run=processed_count_before_run,
+                )
+
                 rows_since_flush += 1
                 if rows_since_flush >= flush_every_rows:
-                    predictions_file.flush()
-                    os.fsync(predictions_file.fileno())
+                    flush_predictions_file(predictions_file)
                     rows_since_flush = 0
 
         if rows_since_flush > 0:
-            predictions_file.flush()
-            os.fsync(predictions_file.fileno())
+            flush_predictions_file(predictions_file)
+
+    return prediction_rows, y_true, y_pred, processed_count_before_run, len(processed_sample_ids)
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_json(args.config)
+    dataset_path = Path(config["dataset_path"])
+    output_dir = Path(config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    predictions_path = output_dir / "predictions.jsonl"
+
+    dataset = load_jsonl(dataset_path)
+    max_samples = config.get("max_samples")
+    if isinstance(max_samples, int):
+        dataset = dataset[:max_samples]
+
+    model, tokenizer, model_input_device = load_model_and_tokenizer(config)
+    adapter_path = config.get("adapter_path")
+
+    resume_enabled = bool(config.get("resume", True))
+    flush_every_rows = max(1, int(config.get("flush_every_rows", 10)))
+    progress_every_rows = max(1, int(config.get("progress_every_rows", 100)))
+
+    batch_size = max(1, int(config.get("batch_size", 1)))
+    max_length = resolve_effective_max_length(tokenizer, config)
+    label_token_reserve = max(8, int(config.get("label_token_reserve", 16)))
+    max_prompt_tokens = max(1, max_length - label_token_reserve)
+
+    (
+        prediction_rows,
+        y_true,
+        y_pred,
+        processed_count_before_run,
+        processed_total_after_run,
+    ) = run_evaluation(
+        dataset=dataset,
+        model=model,
+        tokenizer=tokenizer,
+        model_input_device=model_input_device,
+        predictions_path=predictions_path,
+        resume_enabled=resume_enabled,
+        flush_every_rows=flush_every_rows,
+        progress_every_rows=progress_every_rows,
+        batch_size=batch_size,
+        max_length=max_length,
+        max_prompt_tokens=max_prompt_tokens,
+    )
 
     metrics = calc_binary_metrics(y_true, y_pred)
     truncated_count = sum(1 for row in prediction_rows if row["prompt_truncated"])
@@ -393,7 +520,7 @@ def main() -> None:
 
     print(
         f"resume_enabled={resume_enabled} processed_before_run={processed_count_before_run} "
-        f"processed_total={len(processed_sample_ids)}"
+        f"processed_total={processed_total_after_run}"
     )
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 

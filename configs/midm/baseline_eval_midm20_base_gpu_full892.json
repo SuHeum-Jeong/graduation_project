@@ -1,0 +1,11 @@
+{
+  "model_name_or_path": "K-intelligence/Midm-2.0-Base-Instruct",
+  "dataset_path": "data/final/smoke_conversation_raw_only_test.jsonl",
+  "output_dir": "outputs/baseline_eval_midm20_base_gpu_full892",
+  "max_samples": null,
+  "torch_dtype": "float16",
+  "device_map": "auto",
+  "batch_size": 1,
+  "max_length": 4096,
+  "label_token_reserve": 16
+}

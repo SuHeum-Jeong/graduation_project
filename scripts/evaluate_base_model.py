@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,10 +35,18 @@ def load_json(path: Path) -> Any:
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as file:
-        for line in file:
+        lines = file.readlines()
+        for line_idx, line in enumerate(lines):
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # If the process was interrupted mid-write, tolerate only the
+                    # broken tail line so resume can continue safely.
+                    if line_idx == len(lines) - 1:
+                        break
+                    raise
     return rows
 
 
@@ -147,6 +157,29 @@ def score_candidate_labels(
     prompt_lengths = prompt_encoded["attention_mask"].sum(dim=1).tolist()
     scores_by_row = [dict() for _ in prompt_texts]
 
+    # Fast path: when every candidate label maps to exactly one token
+    # (e.g. "0"/"1"), a single forward pass on prompts is enough.
+    label_token_ids: dict[str, int] = {}
+    for label in candidate_labels:
+        token_ids = tokenizer.encode(label, add_special_tokens=False)
+        if len(token_ids) != 1:
+            label_token_ids = {}
+            break
+        label_token_ids[label] = token_ids[0]
+
+    if label_token_ids:
+        encoded = {key: value.to(model_input_device) for key, value in prompt_encoded.items()}
+        with torch.no_grad():
+            logits = model(**encoded).logits
+
+        next_token_log_probs = torch.log_softmax(logits, dim=-1)
+        for row_idx, prompt_length in enumerate(prompt_lengths):
+            next_token_pos = max(int(prompt_length) - 1, 0)
+            row_log_probs = next_token_log_probs[row_idx, next_token_pos]
+            for label, token_id in label_token_ids.items():
+                scores_by_row[row_idx][label] = float(row_log_probs[token_id].item())
+        return scores_by_row
+
     for label in candidate_labels:
         full_texts = [f"{prompt}{label}" for prompt in prompt_texts]
         encoded = tokenizer(
@@ -186,6 +219,7 @@ def main() -> None:
     dataset_path = Path(config["dataset_path"])
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    predictions_path = output_dir / "predictions.jsonl"
 
     dataset = load_jsonl(dataset_path)
     max_samples = config.get("max_samples")
@@ -220,50 +254,86 @@ def main() -> None:
     model.eval()
     model_input_device = next(model.parameters()).device
 
+    resume_enabled = bool(config.get("resume", True))
+    flush_every_rows = max(1, int(config.get("flush_every_rows", 10)))
+    progress_every_rows = max(1, int(config.get("progress_every_rows", 100)))
+
     y_true: list[str] = []
     y_pred: list[str] = []
     prediction_rows: list[dict[str, Any]] = []
+    processed_sample_ids: set[str] = set()
+    rows_since_flush = 0
+
+    if resume_enabled and predictions_path.exists():
+        prediction_rows = load_jsonl(predictions_path)
+        for row in prediction_rows:
+            sample_id = row.get("sample_id")
+            if sample_id is not None:
+                processed_sample_ids.add(str(sample_id))
+            gold = row.get("gold")
+            prediction = row.get("prediction")
+            if gold in {"0", "1"} and prediction in {"0", "1"}:
+                y_true.append(gold)
+                y_pred.append(prediction)
+
+    predictions_file_mode = "a" if resume_enabled and predictions_path.exists() else "w"
+    processed_count_before_run = len(processed_sample_ids)
+    total_rows = len(dataset)
+    started_at = time.time()
+    next_progress_report = (
+        ((processed_count_before_run // progress_every_rows) + 1) * progress_every_rows
+        if processed_count_before_run < total_rows
+        else total_rows
+    )
     batch_size = max(1, int(config.get("batch_size", 1)))
     candidate_labels = ["0", "1"]
     max_length = resolve_effective_max_length(tokenizer, config)
     label_token_reserve = max(8, int(config.get("label_token_reserve", 16)))
     max_prompt_tokens = max(1, max_length - label_token_reserve)
 
-    for start_idx in range(0, len(dataset), batch_size):
-        batch_rows = dataset[start_idx : start_idx + batch_size]
-        raw_prompt_texts = [
-            build_chat_prompt(
-                tokenizer,
-                make_prompt(row.get("instruction", ""), row.get("input", "")),
+    with predictions_path.open(predictions_file_mode, encoding="utf-8") as predictions_file:
+        for start_idx in range(0, len(dataset), batch_size):
+            candidate_batch_rows = dataset[start_idx : start_idx + batch_size]
+            batch_rows = [
+                row
+                for row in candidate_batch_rows
+                if str(row.get("sample_id")) not in processed_sample_ids
+            ]
+            if not batch_rows:
+                continue
+
+            raw_prompt_texts = [
+                build_chat_prompt(
+                    tokenizer,
+                    make_prompt(row.get("instruction", ""), row.get("input", "")),
+                )
+                for row in batch_rows
+            ]
+            trimmed_prompt_pairs = [
+                trim_prompt_text(tokenizer, prompt_text, max_prompt_tokens)
+                for prompt_text in raw_prompt_texts
+            ]
+            prompt_texts = [prompt_text for prompt_text, _ in trimmed_prompt_pairs]
+            label_scores = score_candidate_labels(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_texts=prompt_texts,
+                candidate_labels=candidate_labels,
+                model_input_device=model_input_device,
+                max_length=max_length,
             )
-            for row in batch_rows
-        ]
-        trimmed_prompt_pairs = [
-            trim_prompt_text(tokenizer, prompt_text, max_prompt_tokens)
-            for prompt_text in raw_prompt_texts
-        ]
-        prompt_texts = [prompt_text for prompt_text, _ in trimmed_prompt_pairs]
-        label_scores = score_candidate_labels(
-            model=model,
-            tokenizer=tokenizer,
-            prompt_texts=prompt_texts,
-            candidate_labels=candidate_labels,
-            model_input_device=model_input_device,
-            max_length=max_length,
-        )
-        for row, score_map, (_, was_truncated), prompt_text in zip(
-            batch_rows,
-            label_scores,
-            trimmed_prompt_pairs,
-            prompt_texts,
-        ):
-            gold = get_row_label(row)
-            prediction = max(candidate_labels, key=lambda label: score_map.get(label, float("-inf")))
-            if gold in {"0", "1"}:
-                y_true.append(gold)
-                y_pred.append(prediction)
-            prediction_rows.append(
-                {
+            for row, score_map, (_, was_truncated), prompt_text in zip(
+                batch_rows,
+                label_scores,
+                trimmed_prompt_pairs,
+                prompt_texts,
+            ):
+                gold = get_row_label(row)
+                prediction = max(candidate_labels, key=lambda label: score_map.get(label, float("-inf")))
+                if gold in {"0", "1"}:
+                    y_true.append(gold)
+                    y_pred.append(prediction)
+                prediction_row = {
                     "sample_id": row["sample_id"],
                     "sample_type": row["sample_type"],
                     "parent_conversation_id": row.get("parent_conversation_id"),
@@ -275,7 +345,29 @@ def main() -> None:
                     "prompt_char_length": len(prompt_text),
                     "correct": prediction == gold if gold in {"0", "1"} else None,
                 }
-            )
+                prediction_rows.append(prediction_row)
+                processed_sample_ids.add(str(row.get("sample_id")))
+                predictions_file.write(json.dumps(prediction_row, ensure_ascii=False) + "\n")
+                processed_total = len(processed_sample_ids)
+                if processed_total >= next_progress_report:
+                    elapsed_seconds = time.time() - started_at
+                    processed_in_run = max(1, processed_total - processed_count_before_run)
+                    rows_left = max(0, total_rows - processed_total)
+                    eta_seconds = int((elapsed_seconds / processed_in_run) * rows_left)
+                    print(
+                        f"[PROGRESS] {processed_total}/{total_rows} "
+                        f"(elapsed={int(elapsed_seconds)}s, eta~{eta_seconds}s)"
+                    )
+                    next_progress_report += progress_every_rows
+                rows_since_flush += 1
+                if rows_since_flush >= flush_every_rows:
+                    predictions_file.flush()
+                    os.fsync(predictions_file.fileno())
+                    rows_since_flush = 0
+
+        if rows_since_flush > 0:
+            predictions_file.flush()
+            os.fsync(predictions_file.fileno())
 
     metrics = calc_binary_metrics(y_true, y_pred)
     truncated_count = sum(1 for row in prediction_rows if row["prompt_truncated"])
@@ -294,15 +386,15 @@ def main() -> None:
         "examples": prediction_rows[:20],
     }
 
-    with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as file:
-        for row in prediction_rows:
-            file.write(json.dumps(row, ensure_ascii=False) + "\n")
-
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as file:
         json.dump(metrics, file, ensure_ascii=False, indent=2)
     with (output_dir / "report.json").open("w", encoding="utf-8") as file:
         json.dump(report, file, ensure_ascii=False, indent=2)
 
+    print(
+        f"resume_enabled={resume_enabled} processed_before_run={processed_count_before_run} "
+        f"processed_total={len(processed_sample_ids)}"
+    )
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 

@@ -141,6 +141,16 @@ The training script reads `data/final/train.jsonl` and `data/final/valid.jsonl`.
 
 The training script uses the same chat-template prompt format as evaluation and masks prompt tokens so loss is applied only to the final `0` or `1` label token.
 
+The default LoRA config is tuned as a conservative QLoRA starting point for dual RTX 5060 Ti GPUs:
+
+- `use_4bit: true`
+- `batch_size: 1`
+- `grad_accum: 16`
+- `lora_r: 8`
+- `lora_alpha: 16`
+
+Install `bitsandbytes` in the training environment before running with `use_4bit: true`.
+
 The final adapter is saved to:
 
 ```text

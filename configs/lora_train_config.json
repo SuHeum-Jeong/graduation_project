@@ -1,5 +1,5 @@
 {
-  "model_name_or_path": "meta-llama/Llama-3.1-8B-Instruct",
+  "model_name_or_path": "Qwen/Qwen3.5-9B",
   "train_file": "data/final/train.jsonl",
   "valid_file": "data/final/valid.jsonl",
   "output_dir": "outputs/checkpoints",
@@ -13,6 +13,7 @@
   "lora_dropout": 0.05,
   "use_4bit": false,
   "device_map": "auto",
+  "enable_thinking": false,
   "logging_steps": 20,
   "save_total_limit": 2,
   "target_modules": [

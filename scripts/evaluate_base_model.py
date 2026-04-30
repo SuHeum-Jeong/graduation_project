@@ -14,6 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.common import calc_binary_metrics, get_row_label, make_prompt
 
+BINARY_LABELS = ("0", "1")
+SYSTEM_MESSAGE = (
+    "너는 보이스피싱 통화 여부를 판별하는 이진 분류기다. "
+    "입력된 통화가 보이스피싱이 아니면 0, 보이스피싱이면 1을 출력하라. "
+    "반드시 0 또는 1 한 글자만 출력하고 다른 설명은 금지한다."
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -40,26 +47,55 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def build_chat_prompt(tokenizer: Any, prompt: str) -> str:
+def resolve_path_config(config: dict[str, Any], key: str) -> Path:
+    value = config.get(key)
+    if not value:
+        raise ValueError(f"Missing required config value: {key}")
+    return Path(value)
+
+
+def resolve_positive_int_config(config: dict[str, Any], key: str, default: int) -> int:
+    value = config.get(key, default)
+    try:
+        parsed_value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Config value must be an integer: {key}") from exc
+    return max(1, parsed_value)
+
+
+def resolve_chat_template_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if "enable_thinking" in config:
+        kwargs["enable_thinking"] = bool(config["enable_thinking"])
+    return kwargs
+
+
+def build_chat_prompt(tokenizer: Any, prompt: str, config: dict[str, Any]) -> str:
     if not hasattr(tokenizer, "apply_chat_template"):
         return prompt
 
     messages = [
         {
             "role": "system",
-            "content": (
-                "너는 보이스피싱 통화 여부를 판별하는 이진 분류기다. "
-                "입력된 통화가 보이스피싱이 아니면 0, 보이스피싱이면 1을 출력하라. "
-                "반드시 0 또는 1 한 글자만 출력하고 다른 설명은 금지한다."
-            ),
+            "content": SYSTEM_MESSAGE,
         },
         {"role": "user", "content": prompt},
     ]
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    chat_template_kwargs = resolve_chat_template_kwargs(config)
+
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
 
 def resolve_effective_max_length(tokenizer: Any, config: dict[str, Any]) -> int:
@@ -180,18 +216,16 @@ def score_candidate_labels(
     return scores_by_row
 
 
-def main() -> None:
-    args = parse_args()
-    config = load_json(args.config)
-    dataset_path = Path(config["dataset_path"])
-    output_dir = Path(config["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+def load_dataset(config: dict[str, Any]) -> tuple[Path, list[dict[str, Any]]]:
+    dataset_path = resolve_path_config(config, "dataset_path")
     dataset = load_jsonl(dataset_path)
     max_samples = config.get("max_samples")
     if isinstance(max_samples, int):
         dataset = dataset[:max_samples]
+    return dataset_path, dataset
 
+
+def load_tokenizer_and_model(config: dict[str, Any]) -> tuple[Any, Any, Any]:
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -202,15 +236,22 @@ def main() -> None:
             "환경 준비 후 다시 실행하세요."
         ) from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(config["model_name_or_path"])
+    model_name_or_path = config.get("model_name_or_path")
+    if not model_name_or_path:
+        raise ValueError("Missing required config value: model_name_or_path")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
     torch_dtype_name = config.get("torch_dtype", "bfloat16")
+    if not hasattr(torch, torch_dtype_name):
+        raise ValueError(f"Unsupported torch dtype: {torch_dtype_name}")
     torch_dtype = getattr(torch, torch_dtype_name)
+
     model = AutoModelForCausalLM.from_pretrained(
-        config["model_name_or_path"],
+        model_name_or_path,
         torch_dtype=torch_dtype,
         device_map=config.get("device_map", "auto"),
     )
@@ -219,69 +260,147 @@ def main() -> None:
         model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
     model_input_device = next(model.parameters()).device
+    return tokenizer, model, model_input_device
 
+
+def prepare_prompt_batch(
+    tokenizer: Any,
+    batch_rows: list[dict[str, Any]],
+    config: dict[str, Any],
+    max_prompt_tokens: int,
+) -> tuple[list[str], list[bool]]:
+    raw_prompt_texts = [
+        build_chat_prompt(
+            tokenizer,
+            make_prompt(row.get("instruction", ""), row.get("input", "")),
+            config,
+        )
+        for row in batch_rows
+    ]
+    trimmed_prompt_pairs = [
+        trim_prompt_text(tokenizer, prompt_text, max_prompt_tokens)
+        for prompt_text in raw_prompt_texts
+    ]
+    return (
+        [prompt_text for prompt_text, _ in trimmed_prompt_pairs],
+        [was_truncated for _, was_truncated in trimmed_prompt_pairs],
+    )
+
+
+def build_prediction_row(
+    row: dict[str, Any],
+    gold: str,
+    prediction: str,
+    score_map: dict[str, float],
+    prompt_text: str,
+    was_truncated: bool,
+) -> dict[str, Any]:
+    return {
+        "sample_id": row["sample_id"],
+        "sample_type": row["sample_type"],
+        "parent_conversation_id": row.get("parent_conversation_id"),
+        "gold": gold or None,
+        "prediction": prediction,
+        "raw_prediction_text": prediction,
+        "label_scores": score_map,
+        "prompt_truncated": was_truncated,
+        "prompt_char_length": len(prompt_text),
+        "correct": prediction == gold if gold in BINARY_LABELS else None,
+    }
+
+
+def evaluate_dataset(
+    model: Any,
+    tokenizer: Any,
+    dataset: list[dict[str, Any]],
+    config: dict[str, Any],
+    model_input_device: Any,
+) -> tuple[list[str], list[str], list[dict[str, Any]], int, int]:
     y_true: list[str] = []
     y_pred: list[str] = []
     prediction_rows: list[dict[str, Any]] = []
-    batch_size = max(1, int(config.get("batch_size", 1)))
-    candidate_labels = ["0", "1"]
+    batch_size = resolve_positive_int_config(config, "batch_size", 1)
     max_length = resolve_effective_max_length(tokenizer, config)
-    label_token_reserve = max(8, int(config.get("label_token_reserve", 16)))
+    label_token_reserve = max(8, resolve_positive_int_config(config, "label_token_reserve", 16))
     max_prompt_tokens = max(1, max_length - label_token_reserve)
 
     for start_idx in range(0, len(dataset), batch_size):
         batch_rows = dataset[start_idx : start_idx + batch_size]
-        raw_prompt_texts = [
-            build_chat_prompt(
-                tokenizer,
-                make_prompt(row.get("instruction", ""), row.get("input", "")),
-            )
-            for row in batch_rows
-        ]
-        trimmed_prompt_pairs = [
-            trim_prompt_text(tokenizer, prompt_text, max_prompt_tokens)
-            for prompt_text in raw_prompt_texts
-        ]
-        prompt_texts = [prompt_text for prompt_text, _ in trimmed_prompt_pairs]
+        prompt_texts, truncated_flags = prepare_prompt_batch(
+            tokenizer=tokenizer,
+            batch_rows=batch_rows,
+            config=config,
+            max_prompt_tokens=max_prompt_tokens,
+        )
         label_scores = score_candidate_labels(
             model=model,
             tokenizer=tokenizer,
             prompt_texts=prompt_texts,
-            candidate_labels=candidate_labels,
+            candidate_labels=list(BINARY_LABELS),
             model_input_device=model_input_device,
             max_length=max_length,
         )
-        for row, score_map, (_, was_truncated), prompt_text in zip(
+        for row, score_map, was_truncated, prompt_text in zip(
             batch_rows,
             label_scores,
-            trimmed_prompt_pairs,
+            truncated_flags,
             prompt_texts,
         ):
             gold = get_row_label(row)
-            prediction = max(candidate_labels, key=lambda label: score_map.get(label, float("-inf")))
-            if gold in {"0", "1"}:
+            prediction = max(BINARY_LABELS, key=lambda label: score_map.get(label, float("-inf")))
+            if gold in BINARY_LABELS:
                 y_true.append(gold)
                 y_pred.append(prediction)
             prediction_rows.append(
-                {
-                    "sample_id": row["sample_id"],
-                    "sample_type": row["sample_type"],
-                    "parent_conversation_id": row.get("parent_conversation_id"),
-                    "gold": gold or None,
-                    "prediction": prediction,
-                    "raw_prediction_text": prediction,
-                    "label_scores": score_map,
-                    "prompt_truncated": was_truncated,
-                    "prompt_char_length": len(prompt_text),
-                    "correct": prediction == gold if gold in {"0", "1"} else None,
-                }
+                build_prediction_row(
+                    row=row,
+                    gold=gold,
+                    prediction=prediction,
+                    score_map=score_map,
+                    prompt_text=prompt_text,
+                    was_truncated=was_truncated,
+                )
             )
+
+    return y_true, y_pred, prediction_rows, max_length, label_token_reserve
+
+
+def write_outputs(
+    output_dir: Path,
+    metrics: dict[str, float | int],
+    report: dict[str, Any],
+    prediction_rows: list[dict[str, Any]],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as file:
+        for row in prediction_rows:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    with (output_dir / "metrics.json").open("w", encoding="utf-8") as file:
+        json.dump(metrics, file, ensure_ascii=False, indent=2)
+    with (output_dir / "report.json").open("w", encoding="utf-8") as file:
+        json.dump(report, file, ensure_ascii=False, indent=2)
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_json(args.config)
+    dataset_path, dataset = load_dataset(config)
+    output_dir = resolve_path_config(config, "output_dir")
+    tokenizer, model, model_input_device = load_tokenizer_and_model(config)
+    y_true, y_pred, prediction_rows, max_length, label_token_reserve = evaluate_dataset(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        config=config,
+        model_input_device=model_input_device,
+    )
 
     metrics = calc_binary_metrics(y_true, y_pred)
     truncated_count = sum(1 for row in prediction_rows if row["prompt_truncated"])
     report = {
         "model_name": config["model_name_or_path"],
-        "adapter_path": adapter_path,
+        "adapter_path": config.get("adapter_path"),
         "test_file": str(dataset_path),
         "prediction_mode": "label_scoring",
         "max_length": max_length,
@@ -294,15 +413,7 @@ def main() -> None:
         "examples": prediction_rows[:20],
     }
 
-    with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as file:
-        for row in prediction_rows:
-            file.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    with (output_dir / "metrics.json").open("w", encoding="utf-8") as file:
-        json.dump(metrics, file, ensure_ascii=False, indent=2)
-    with (output_dir / "report.json").open("w", encoding="utf-8") as file:
-        json.dump(report, file, ensure_ascii=False, indent=2)
-
+    write_outputs(output_dir, metrics, report, prediction_rows)
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 
 

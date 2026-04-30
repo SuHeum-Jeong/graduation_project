@@ -1,3 +1,4 @@
+# Split을 기준으로 JSONL 생성
 #!/usr/bin/env python3
 
 from __future__ import annotations
@@ -6,7 +7,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 CONVERSATION_INSTRUCTION = (
@@ -18,6 +19,10 @@ PREFIX_INSTRUCTION = (
     "위험하면 1, 아니면 0만 출력하라."
 )
 LABELED_ID_PATTERN = re.compile(r"^labeled_(\d{6,7})\.json$")
+RAW_ID_DIGITS = 6
+SPLIT_NAMES = ("train", "valid", "test")
+SplitName = Literal["train", "valid", "test"]
+SplitManifest = dict[SplitName, list[int]]
 
 
 def load_json(path: Path) -> Any:
@@ -39,17 +44,29 @@ def render_input(utterances: list[dict[str, Any]]) -> str:
 def collect_labeled_map(*directories: Path) -> dict[int, Path]:
     labeled_map: dict[int, Path] = {}
     for directory in directories:
+        if not directory.exists():
+            raise FileNotFoundError(f"Labeled conversation directory does not exist: {directory}")
         for path in sorted(directory.glob("labeled_*.json")):
             match = LABELED_ID_PATTERN.match(path.name)
             if not match:
                 continue
-            labeled_map[int(match.group(1))] = path
+            conversation_id = int(match.group(1))
+            if conversation_id in labeled_map:
+                raise ValueError(
+                    f"Duplicate labeled conversation ID {conversation_id}: "
+                    f"{labeled_map[conversation_id]} and {path}"
+                )
+            labeled_map[conversation_id] = path
     return labeled_map
 
 
 def base_raw_id(conversation_id: int) -> int:
     raw_id_str = str(conversation_id)
-    return int(raw_id_str[:6]) if len(raw_id_str) > 6 else conversation_id
+    return int(raw_id_str[:RAW_ID_DIGITS]) if len(raw_id_str) > RAW_ID_DIGITS else conversation_id
+
+
+def is_raw_conversation_id(conversation_id: int) -> bool:
+    return len(str(conversation_id)) == RAW_ID_DIGITS
 
 
 def build_conversation_sample(conversation: dict[str, Any]) -> dict[str, Any]:
@@ -103,7 +120,7 @@ def build_prefix_samples(conversation: dict[str, Any], prefix_step: int) -> list
 
 
 def build_split_payload(
-    split_name: str,
+    split_name: SplitName,
     split_ids_set: set[int],
     labeled_map: dict[int, Path],
     prefix_step: int,
@@ -111,22 +128,69 @@ def build_split_payload(
     conversation_rows: list[dict[str, Any]] = []
     prefix_rows: list[dict[str, Any]] = []
 
-    eligible_ids: list[int] = []
-    for conversation_id in labeled_map:
-        root_id = base_raw_id(conversation_id)
-        if split_name == "train":
-            if root_id in split_ids_set:
-                eligible_ids.append(conversation_id)
-        else:
-            if conversation_id in split_ids_set and len(str(conversation_id)) == 6:
-                eligible_ids.append(conversation_id)
+    eligible_ids = sorted(
+        conversation_id
+        for conversation_id in labeled_map
+        if is_conversation_eligible_for_split(conversation_id, split_name, split_ids_set)
+    )
 
-    for conversation_id in sorted(eligible_ids):
+    for conversation_id in eligible_ids:
         conversation = load_json(labeled_map[conversation_id])
         conversation_rows.append(build_conversation_sample(conversation))
         prefix_rows.extend(build_prefix_samples(conversation, prefix_step=prefix_step))
 
     return conversation_rows, prefix_rows, conversation_rows + prefix_rows
+
+
+def is_conversation_eligible_for_split(
+    conversation_id: int,
+    split_name: SplitName,
+    split_ids_set: set[int],
+) -> bool:
+    if split_name == "train":
+        return base_raw_id(conversation_id) in split_ids_set
+    return is_raw_conversation_id(conversation_id) and conversation_id in split_ids_set
+
+
+def validate_split_manifest(split_manifest: dict[str, Any]) -> SplitManifest:
+    missing_keys = [split_name for split_name in SPLIT_NAMES if split_name not in split_manifest]
+    if missing_keys:
+        raise ValueError(f"Split manifest is missing keys: {', '.join(missing_keys)}")
+
+    normalized_manifest: SplitManifest = {"train": [], "valid": [], "test": []}
+    seen: dict[int, SplitName] = {}
+    duplicate_ids: list[int] = []
+    for split_name in SPLIT_NAMES:
+        split_ids = split_manifest[split_name]
+        if not isinstance(split_ids, list):
+            raise ValueError(f"Split manifest value must be a list: {split_name}")
+        normalized_manifest[split_name] = [int(conversation_id) for conversation_id in split_ids]
+        for conversation_id in normalized_manifest[split_name]:
+            if conversation_id in seen:
+                duplicate_ids.append(conversation_id)
+            seen[conversation_id] = split_name
+
+    if duplicate_ids:
+        duplicate_text = ", ".join(str(conversation_id) for conversation_id in sorted(set(duplicate_ids))[:20])
+        raise ValueError(f"Conversation IDs appear in multiple splits: {duplicate_text}")
+
+    return normalized_manifest
+
+
+def validate_labeled_coverage(split_manifest: SplitManifest, labeled_map: dict[int, Path]) -> None:
+    raw_ids = {
+        conversation_id
+        for split_name in SPLIT_NAMES
+        for conversation_id in split_manifest[split_name]
+    }
+    missing_labeled_ids = sorted(
+        conversation_id for conversation_id in raw_ids if conversation_id not in labeled_map
+    )
+    if missing_labeled_ids:
+        raise ValueError(
+            "Missing labeled files for raw conversations: "
+            + ", ".join(str(conversation_id) for conversation_id in missing_labeled_ids[:20])
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,26 +209,16 @@ def main() -> None:
     paths = config["paths"]
 
     manifest_path = Path(paths["splits_dir"]) / f"split_manifest_{config['version']}.json"
-    split_manifest = load_json(manifest_path)
+    split_manifest = validate_split_manifest(load_json(manifest_path))
 
     labeled_map = collect_labeled_map(
         Path(paths["labeled_normal_dir"]),
         Path(paths["labeled_abnormal_dir"]),
     )
 
-    raw_ids = {
-        conversation_id
-        for split_name in ("train", "valid", "test")
-        for conversation_id in split_manifest[split_name]
-    }
-    missing_labeled_ids = sorted(conversation_id for conversation_id in raw_ids if conversation_id not in labeled_map)
-    if missing_labeled_ids:
-        raise ValueError(
-            "Missing labeled files for raw conversations: "
-            + ", ".join(str(conversation_id) for conversation_id in missing_labeled_ids[:20])
-        )
+    validate_labeled_coverage(split_manifest, labeled_map)
 
-    for split_name in ("train", "valid", "test"):
+    for split_name in SPLIT_NAMES:
         conversation_rows, prefix_rows, final_rows = build_split_payload(
             split_name=split_name,
             split_ids_set=set(split_manifest[split_name]),

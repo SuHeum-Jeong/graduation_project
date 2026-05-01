@@ -1,0 +1,6 @@
+accelerate>=1.0.0
+peft>=0.14.0
+protobuf>=5.0.0
+safetensors>=0.4.5
+sentencepiece>=0.2.0
+transformers>=4.57.0,<6

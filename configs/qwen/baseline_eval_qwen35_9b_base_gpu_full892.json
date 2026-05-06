@@ -1,0 +1,11 @@
+{
+  "model_name_or_path": "Qwen/Qwen3.5-9B-Base",
+  "dataset_path": "data/final/smoke_conversation_raw_only_test.jsonl",
+  "output_dir": "outputs/baseline_eval_qwen35_9b_base_gpu_full892",
+  "max_samples": null,
+  "torch_dtype": "float16",
+  "device_map": "auto",
+  "batch_size": 1,
+  "max_length": 4096,
+  "label_token_reserve": 16
+}

@@ -51,6 +51,60 @@ def parse_prediction(text: str) -> str:
     return ""
 
 
+def trim_prompt_text(
+    tokenizer: Any,
+    prompt: str,
+    max_prompt_tokens: int,
+) -> tuple[str, bool]:
+    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    if len(prompt_tokens) <= max_prompt_tokens:
+        return prompt, False
+
+    marker = "[통화 내용]\n"
+    answer_header = "\n\n[답변]\n0 또는 1"
+    if marker not in prompt or answer_header not in prompt:
+        trimmed_tokens = prompt_tokens[:max_prompt_tokens]
+        return tokenizer.decode(trimmed_tokens, skip_special_tokens=True), True
+
+    prefix, remaining = prompt.split(marker, 1)
+    conversation_text, suffix = remaining.split(answer_header, 1)
+    prefix = f"{prefix}{marker}"
+    suffix = f"{answer_header}{suffix}"
+
+    prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+    suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
+    ellipsis = "\n[중략]\n"
+    ellipsis_tokens = tokenizer.encode(ellipsis, add_special_tokens=False)
+
+    available_tokens = max_prompt_tokens - len(prefix_tokens) - len(suffix_tokens)
+    if available_tokens <= 0:
+        trimmed_tokens = (prefix_tokens + suffix_tokens)[:max_prompt_tokens]
+        return tokenizer.decode(trimmed_tokens, skip_special_tokens=True), True
+
+    conversation_tokens = tokenizer.encode(conversation_text, add_special_tokens=False)
+    if len(conversation_tokens) <= available_tokens:
+        return prompt, False
+
+    if available_tokens <= len(ellipsis_tokens):
+        kept_tokens = conversation_tokens[:available_tokens]
+        trimmed_prompt = f"{prefix}{tokenizer.decode(kept_tokens, skip_special_tokens=True)}{suffix}"
+        return trimmed_prompt, True
+
+    kept_budget = available_tokens - len(ellipsis_tokens)
+    head_budget = kept_budget // 2
+    tail_budget = kept_budget - head_budget
+    head_tokens = conversation_tokens[:head_budget]
+    tail_tokens = conversation_tokens[-tail_budget:] if tail_budget > 0 else []
+    trimmed_prompt = (
+        f"{prefix}"
+        f"{tokenizer.decode(head_tokens, skip_special_tokens=True)}"
+        f"{ellipsis}"
+        f"{tokenizer.decode(tail_tokens, skip_special_tokens=True)}"
+        f"{suffix}"
+    )
+    return trimmed_prompt, True
+
+
 def calc_binary_metrics(y_true: list[str], y_pred: list[str]) -> dict[str, float | int]:
     pairs = [(truth, pred) for truth, pred in zip(y_true, y_pred) if truth in {"0", "1"}]
     if not pairs:

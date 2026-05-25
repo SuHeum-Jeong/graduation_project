@@ -1,0 +1,9 @@
+accelerate>=1.0.0
+fastapi>=0.115.0
+faster-whisper>=1.1.0
+peft>=0.14.0
+python-multipart>=0.0.9
+sentencepiece>=0.2.0
+torch>=2.3.0
+transformers>=4.57.0,<6
+uvicorn[standard]>=0.30.0

@@ -1,0 +1,13 @@
+{
+  "model_name_or_path": "Qwen/Qwen3.5-2B-Base",
+  "dataset_path": "data/final/test.jsonl",
+  "output_dir": "outputs/baseline_eval_qwen35_2b_base",
+  "max_samples": null,
+  "torch_dtype": "bfloat16",
+  "device_map": "auto",
+  "batch_size": 1,
+  "max_length": 1536,
+  "label_token_reserve": 16,
+  "resume": true,
+  "enable_thinking": false
+}

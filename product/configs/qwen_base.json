@@ -1,0 +1,29 @@
+{
+  "runtime": {
+    "interval_sec": 5.0
+  },
+  "stt": {
+    "engine": "faster_whisper",
+    "model_size_or_path": "small",
+    "device": "auto",
+    "compute_type": "default",
+    "language": "ko",
+    "vad_filter": true,
+    "beam_size": 5
+  },
+  "model": {
+    "model_name_or_path": "Qwen/Qwen3.5-2B-Base",
+    "adapter_path": "outputs/checkpoints_qwen35_2b_base/adapter-final",
+    "torch_dtype": "bfloat16",
+    "device_map": "auto",
+    "max_length": 1536,
+    "label_token_reserve": 16,
+    "enable_thinking": false
+  },
+  "risk_policy": {
+    "realtime_warning_threshold": 0.8,
+    "realtime_caution_threshold": 0.65,
+    "realtime_caution_consecutive": 2,
+    "final_warning_threshold": 0.5
+  }
+}

@@ -13,14 +13,36 @@ checkpoints/
 models/
 runs/
 wandb/
+.hf-cache/
+product/runs/
+logs/
+*.log
 
 *.bin
 *.ckpt
 *.pt
 *.pth
 *.safetensors
+*.gguf
+*.onnx
 *.parquet
 *.pkl
+
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.webm
+*.mp4
+*.mov
+
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
 
 .DS_Store
 .idea/

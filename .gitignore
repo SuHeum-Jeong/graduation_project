@@ -13,6 +13,10 @@ checkpoints/
 models/
 runs/
 wandb/
+.hf-cache/
+product/runs/
+logs/
+*.log
 
 # Model and dataset binaries
 *.bin
@@ -20,8 +24,28 @@ wandb/
 *.pt
 *.pth
 *.safetensors
+*.gguf
+*.onnx
 *.parquet
 *.pkl
+
+# Local recordings and media inputs
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.webm
+*.mp4
+*.mov
+
+# Secrets and machine-local settings
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
 
 # OS/editor noise
 .DS_Store

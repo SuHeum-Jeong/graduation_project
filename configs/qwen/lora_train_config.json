@@ -1,0 +1,55 @@
+{
+  "model_name_or_path": "Qwen/Qwen3.5-2B-Base",
+  "train_file": "data/final/train.jsonl",
+  "valid_file": "data/final/valid.jsonl",
+  "output_dir": "outputs/checkpoints_qwen35_2b_base",
+
+  "epochs": 2,
+  "batch_size": 1,
+  "grad_accum": 16,
+  "lr": 0.0001,
+  "warmup_ratio": 0.03,
+  "weight_decay": 0.01,
+
+  "max_length": 1536,
+
+  "lora_r": 16,
+  "lora_alpha": 32,
+  "lora_dropout": 0.05,
+
+  "use_4bit": true,
+  "bnb_4bit_quant_type": "nf4",
+  "bnb_4bit_compute_dtype": "bfloat16",
+  "gradient_checkpointing": true,
+
+  "device_map": "auto",
+  "max_memory": {
+    "0": "14GiB",
+    "1": "14GiB",
+    "cpu": "64GiB"
+  },
+
+  "enable_thinking": false,
+
+  "report_to": "wandb",
+  "wandb_project": "graduation-project-qwen-lora",
+  "run_name": "qwen35-2b-base-lora-r16-len1536-epoch2",
+
+  "logging_steps": 20,
+  "eval_steps": 500,
+  "save_steps": 500,
+  "save_total_limit": 2,
+  "load_best_model_at_end": true,
+  "metric_for_best_model": "eval_loss",
+  "greater_is_better": false,
+
+  "target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+  ]
+}

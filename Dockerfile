@@ -29,4 +29,4 @@ COPY scripts ./scripts
 COPY src ./src
 COPY README.md .
 
-CMD ["python", "scripts/evaluate_base_model.py", "--config", "configs/baseline_eval_config.json"]
+CMD ["python", "scripts/evaluate_base_model.py", "--config", "configs/qwen/baseline_eval_config.json"]

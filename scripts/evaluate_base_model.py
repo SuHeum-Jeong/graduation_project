@@ -14,7 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.common import calc_binary_metrics, get_row_label, make_prompt
+from src.common import calc_binary_metrics, get_row_label, make_prompt, trim_prompt_text
 
 
 VALID_LABELS = {"0", "1"}
@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/baseline_eval_config.json"),
+        default=Path("configs/qwen/baseline_eval_config.json"),
     )
     return parser.parse_args()
 
@@ -54,7 +54,14 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def build_chat_prompt(tokenizer: Any, prompt: str) -> str:
+def resolve_chat_template_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if "enable_thinking" in config:
+        kwargs["enable_thinking"] = bool(config["enable_thinking"])
+    return kwargs
+
+
+def build_chat_prompt(tokenizer: Any, prompt: str, config: dict[str, Any]) -> str:
     if not hasattr(tokenizer, "apply_chat_template"):
         return prompt
 
@@ -69,11 +76,20 @@ def build_chat_prompt(tokenizer: Any, prompt: str) -> str:
         },
         {"role": "user", "content": prompt},
     ]
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    chat_template_kwargs = resolve_chat_template_kwargs(config)
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
 
 def resolve_effective_max_length(tokenizer: Any, config: dict[str, Any]) -> int:
@@ -85,60 +101,6 @@ def resolve_effective_max_length(tokenizer: Any, config: dict[str, Any]) -> int:
     if not isinstance(model_max_length, int) or model_max_length <= 0 or model_max_length > 100000:
         return 4096
     return model_max_length
-
-
-def trim_prompt_text(
-    tokenizer: Any,
-    prompt: str,
-    max_prompt_tokens: int,
-) -> tuple[str, bool]:
-    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
-    if len(prompt_tokens) <= max_prompt_tokens:
-        return prompt, False
-
-    marker = "[통화 내용]\n"
-    answer_header = "\n\n[답변]\n0 또는 1"
-    if marker not in prompt or answer_header not in prompt:
-        trimmed_tokens = prompt_tokens[:max_prompt_tokens]
-        return tokenizer.decode(trimmed_tokens, skip_special_tokens=True), True
-
-    prefix, remaining = prompt.split(marker, 1)
-    conversation_text, suffix = remaining.split(answer_header, 1)
-    prefix = f"{prefix}{marker}"
-    suffix = f"{answer_header}{suffix}"
-
-    prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
-    suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
-    ellipsis = "\n[중략]\n"
-    ellipsis_tokens = tokenizer.encode(ellipsis, add_special_tokens=False)
-
-    available_tokens = max_prompt_tokens - len(prefix_tokens) - len(suffix_tokens)
-    if available_tokens <= 0:
-        trimmed_tokens = (prefix_tokens + suffix_tokens)[:max_prompt_tokens]
-        return tokenizer.decode(trimmed_tokens, skip_special_tokens=True), True
-
-    conversation_tokens = tokenizer.encode(conversation_text, add_special_tokens=False)
-    if len(conversation_tokens) <= available_tokens:
-        return prompt, False
-
-    if available_tokens <= len(ellipsis_tokens):
-        kept_tokens = conversation_tokens[:available_tokens]
-        trimmed_prompt = f"{prefix}{tokenizer.decode(kept_tokens, skip_special_tokens=True)}{suffix}"
-        return trimmed_prompt, True
-
-    kept_budget = available_tokens - len(ellipsis_tokens)
-    head_budget = kept_budget // 2
-    tail_budget = kept_budget - head_budget
-    head_tokens = conversation_tokens[:head_budget]
-    tail_tokens = conversation_tokens[-tail_budget:] if tail_budget > 0 else []
-    trimmed_prompt = (
-        f"{prefix}"
-        f"{tokenizer.decode(head_tokens, skip_special_tokens=True)}"
-        f"{ellipsis}"
-        f"{tokenizer.decode(tail_tokens, skip_special_tokens=True)}"
-        f"{suffix}"
-    )
-    return trimmed_prompt, True
 
 
 def score_candidate_labels(
@@ -361,6 +323,7 @@ def run_evaluation(
     batch_size: int,
     max_length: int,
     max_prompt_tokens: int,
+    config: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[str], list[str], int, int]:
     prediction_rows, processed_sample_ids, y_true, y_pred = restore_previous_run(
         predictions_path=predictions_path,
@@ -394,6 +357,7 @@ def run_evaluation(
                 build_chat_prompt(
                     tokenizer,
                     make_prompt(row.get("instruction", ""), row.get("input", "")),
+                    config,
                 )
                 for row in batch_rows
             ]
@@ -494,6 +458,7 @@ def main() -> None:
         batch_size=batch_size,
         max_length=max_length,
         max_prompt_tokens=max_prompt_tokens,
+        config=config,
     )
 
     metrics = calc_binary_metrics(y_true, y_pred)
